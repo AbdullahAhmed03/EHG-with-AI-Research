@@ -1,0 +1,172 @@
+import pandas as pd
+import numpy as np
+from tsfresh.feature_selection.relevance import calculate_relevance_table
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from imblearn.over_sampling import SMOTE
+from sklearn.metrics import roc_auc_score, average_precision_score, classification_report
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, BatchNormalization, Input
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from sklearn.utils.class_weight import compute_class_weight
+
+# Function to select top n TSFresh features
+def select_top_n_features(X, y, n_top_features):
+    relevance_table = calculate_relevance_table(X, y, ml_task='classification')
+    sorted_table = relevance_table.sort_values(by='p_value')
+    top_n_features = sorted_table.head(n_top_features)['feature']
+    return X[top_n_features], top_n_features
+
+def main():
+    # Load dataset
+    file_path = r"E:\Desktop\Machine Intelligence\combined extracted features with headers\combined_aligned_features.csv"
+    data = pd.read_csv(file_path)
+    
+    # Drop unwanted columns (RecID, Pair_RecID)
+    data = data.drop(columns=["RecID", "Pair_RecID"])
+    
+    # Encode categorical columns (Placental_position to 0 or 1, RecType is the target)
+    label_encoders = {}
+    for column in ['Placental_position', 'RecType']:
+        le = LabelEncoder()
+        data[column] = le.fit_transform(data[column])
+        label_encoders[column] = le
+    
+    # Define obstetric features explicitly
+    obstetric_features = ['Gestation', 'Rectime', 'Age', 'Weight', 'Placental_position', 'Height', 'Newborn_weight']
+    
+    # Define features (X) and target (y)
+    X = data.drop(columns=['RecType'])  # Features
+    y = data['RecType']  # Target
+    
+    # Identify TSFresh features as any column that is NOT in obstetric_features
+    tsfresh_features = [col for col in X.columns if col not in obstetric_features]
+    
+    # Select top TSFresh features
+    X_tsfresh = X[tsfresh_features]
+    X_tsfresh_selected, top_tsfresh_features = select_top_n_features(X_tsfresh, y, n_top_features=100)  # Select top 10 features
+    
+    # Combine the obstetric features with the selected TSFresh features
+    X_selected = pd.concat([X[obstetric_features], X_tsfresh_selected], axis=1)
+    
+    # Stratified train-test split to ensure class distribution in both sets
+    X_train, X_test, y_train, y_test = train_test_split(X_selected, y, test_size=0.3, random_state=42, stratify=y)
+    
+    # Apply SMOTE to balance the training set (reverted to SMOTE for oversampling)
+    smote = SMOTE(random_state=42)
+    X_train_smote, y_train_smote = smote.fit_resample(X_train, y_train)
+    
+    # Normalize features using StandardScaler
+    scaler = StandardScaler()
+    X_train_smote_scaled = scaler.fit_transform(X_train_smote)
+    X_test_scaled = scaler.transform(X_test)
+    
+    # Calculate class weights to help with imbalanced classes
+    class_weights = compute_class_weight('balanced', classes=np.unique(y_train_smote), y=y_train_smote)
+    class_weights_dict = dict(enumerate(class_weights))
+    print(class_weights_dict)
+    
+    # Define the Keras model (deeper Multilayer Perceptron) with batch normalization
+    # Define the Keras model (even deeper Multilayer Perceptron) with batch normalization
+    def create_mlp(input_dim, num_classes):
+        model = Sequential()
+        model.add(Input(shape=(input_dim,)))
+        
+        # First block
+        model.add(Dense(512, activation='relu'))
+        model.add(BatchNormalization())
+        model.add(Dropout(0.5))
+        
+        # Second block
+        model.add(Dense(256, activation='relu'))
+        model.add(BatchNormalization())
+        model.add(Dropout(0.4))
+        
+        # Third block
+        model.add(Dense(128, activation='relu'))
+        model.add(BatchNormalization())
+        model.add(Dropout(0.3))
+        
+        # Fourth block
+        model.add(Dense(64, activation='relu'))
+        model.add(BatchNormalization())
+        model.add(Dropout(0.2))
+    
+        # Output layer
+        model.add(Dense(num_classes, activation='softmax'))
+        
+        model.compile(optimizer=Adam(learning_rate=0.0005), loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+        return model
+    
+    # from tensorflow.keras.regularizers import l2
+    
+    # def create_mlp(input_dim, num_classes):
+    #     model = Sequential()
+    #     model.add(Input(shape=(input_dim,)))
+        
+    #     # First block
+    #     model.add(Dense(256, activation='relu', kernel_regularizer=l2(0.001)))
+    #     model.add(BatchNormalization())
+    #     model.add(Dropout(0.6))
+        
+    #     # Second block
+    #     model.add(Dense(128, activation='relu', kernel_regularizer=l2(0.001)))
+    #     model.add(BatchNormalization())
+    #     model.add(Dropout(0.5))
+        
+    #     # Third block
+    #     model.add(Dense(64, activation='relu', kernel_regularizer=l2(0.001)))
+    #     model.add(BatchNormalization())
+    #     model.add(Dropout(0.4))
+        
+    #     # Output layer
+    #     model.add(Dense(num_classes, activation='softmax'))
+        
+    #     model.compile(optimizer=Adam(learning_rate=0.001), loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    #     return model
+    
+    
+    
+    # Initialize the model
+    input_dim = X_train_smote_scaled.shape[1]
+    num_classes = len(np.unique(y_train_smote))
+    mlp_model = create_mlp(input_dim, num_classes)
+    
+    # Set EarlyStopping and ReduceLROnPlateau to prevent overfitting and adjust learning rate dynamically
+    early_stopping = EarlyStopping(monitor='val_loss', patience=30, restore_best_weights=True)
+    reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6)
+    
+    # Train the model with class weights, custom batch size, and number of epochs
+    history = mlp_model.fit(
+        X_train_smote_scaled, 
+        y_train_smote, 
+        epochs=200,
+        batch_size=32,  # Increased batch size
+        validation_split=0.2,
+        # callbacks=[early_stopping, reduce_lr],
+        class_weight=class_weights_dict,
+        verbose=1
+    )
+    
+    # Evaluate the model on the test set
+    y_pred_proba = mlp_model.predict(X_test_scaled)
+    
+    # Convert predictions from probabilities to predicted classes
+    y_pred = y_pred_proba.argmax(axis=1)
+    
+    # Calculate AUC and Average Precision on the test set for multiclass
+    auc = roc_auc_score(y_test, y_pred_proba, multi_class='ovr')
+    avg_precision = average_precision_score(y_test, y_pred_proba, average="macro")
+    
+    print(f"Test AUC: {auc}")
+    print(f"Test Average Precision: {avg_precision}")
+    
+    # Generate classification report
+    report = classification_report(y_test, y_pred)
+    print(f"Classification Report:\n{report}")
+
+
+# Run the main function
+if __name__ == "__main__":
+    main()

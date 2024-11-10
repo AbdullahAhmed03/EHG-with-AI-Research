@@ -1,0 +1,153 @@
+import pandas as pd
+from tsfresh.feature_selection.relevance import calculate_relevance_table
+from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import roc_auc_score, average_precision_score, classification_report, make_scorer
+from xgboost import XGBClassifier
+from imblearn.over_sampling import SMOTE
+
+# Function to select top n TSFresh features
+def select_top_n_features(X, y, n_top_features):
+    relevance_table = calculate_relevance_table(X, y, ml_task='classification')
+    sorted_table = relevance_table.sort_values(by='p_value')
+    top_n_features = sorted_table.head(n_top_features)['feature']
+    return X[top_n_features], top_n_features
+
+# Function to run model with or without SMOTE
+def run_model(X_train, X_test, y_train, y_test, scaler, n_top_features, param_grid_xgb, scoring, apply_smote):
+    # Apply SMOTE if specified
+    if apply_smote:
+        smote = SMOTE(random_state=42)
+        X_train, y_train = smote.fit_resample(X_train, y_train)
+        smote_status = "with SMOTE"
+    else:
+        smote_status = "without SMOTE"
+
+    # Scale data
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    # Initialize XGBoost classifier and GridSearchCV
+    xgb_model = XGBClassifier(objective='multi:softprob', random_state=30, eval_metric='mlogloss')
+    grid_search = GridSearchCV(
+        estimator=xgb_model,
+        param_grid=param_grid_xgb,
+        cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42),
+        scoring=scoring,
+        refit='AUC',
+        n_jobs=-1,
+        verbose=1
+    )
+
+    # Fit model
+    print(f"\nRunning model {smote_status} with {n_top_features} TSFresh features")
+    grid_search.fit(X_train_scaled, y_train)
+
+    # Best estimator from GridSearchCV
+    best_xgb_model = grid_search.best_estimator_
+    y_pred_proba = best_xgb_model.predict_proba(X_test_scaled)
+
+    # Calculate AUC and Average Precision on the test set
+    auc = roc_auc_score(y_test, y_pred_proba, multi_class='ovr')
+    avg_precision = average_precision_score(y_test, y_pred_proba, average="macro")
+
+    # Classification report
+    y_pred = best_xgb_model.predict(X_test_scaled)
+    report = classification_report(y_test, y_pred)
+
+    # Print and return results
+    print(f"Test AUC: {auc}")
+    print(f"Test Average Precision: {avg_precision}")
+    print(f"Classification Report:\n{report}")
+    
+    return {
+        'SMOTE Applied': apply_smote,
+        'TSFresh Features': n_top_features,
+        'AUC': auc,
+        'Average Precision': avg_precision,
+        'Classification Report': report
+    }
+
+
+def main():
+    # Load dataset
+    file_path = r"E:\Desktop\Machine Intelligence\combined extracted features with headers\combined_aligned_features.csv"
+    data = pd.read_csv(file_path)
+    
+    # Drop unwanted columns (RecID, Pair_RecID)
+    data = data.drop(columns=["RecID", "Pair_RecID"])
+    
+    # Encode categorical columns (Placental_position and RecType)
+    label_encoders = {}
+    for column in ['Placental_position', 'RecType']:
+        le = LabelEncoder()
+        data[column] = le.fit_transform(data[column])
+        label_encoders[column] = le
+    
+    # Define obstetric features and features (X) and target (y)
+    obstetric_features = ['Gestation', 'Rectime', 'Age', 'Weight', 'Placental_position', 'Height', 'Newborn_weight']
+    X = data.drop(columns=['RecType'])
+    y = data['RecType']
+    
+    # Identify TSFresh features as any column that is NOT in obstetric_features
+    tsfresh_features = [col for col in X.columns if col not in obstetric_features]
+    tsfresh_feature_counts = [20]
+    
+    # Define scalers
+    scalers = {
+        'StandardScaler': StandardScaler(),
+    }
+    
+    # Define hyperparameter grid for XGBoost
+    param_grid_xgb = {
+        'n_estimators': [100],
+        'learning_rate': [0.1],
+        'max_depth': [5],
+        'subsample': [0.8],
+        'colsample_bytree': [0.4]
+    }
+    
+    # Define scoring metrics
+    scoring = {
+        'AUC': make_scorer(roc_auc_score, response_method='predict_proba', multi_class='ovr'),
+        'Average Precision': make_scorer(average_precision_score, response_method='predict_proba', average='macro')
+    }
+    
+    # Store all results for comparison
+    all_results = []
+    
+    # Iterate over different scalers and TSFresh feature counts
+    for scaler_name, scaler in scalers.items():
+        print(f"Testing with scaler: {scaler_name}")
+        for n_top_features in tsfresh_feature_counts:
+            print(f"Testing with {n_top_features} TSFresh features")
+            
+            # Select top TSFresh features
+            X_tsfresh = X[tsfresh_features]
+            X_tsfresh_selected, top_tsfresh_features = select_top_n_features(X_tsfresh, y, n_top_features)
+    
+            # Combine obstetric features with selected TSFresh features
+            X_selected = pd.concat([X[obstetric_features], X_tsfresh_selected], axis=1)
+    
+            # Split data into training and test sets
+            X_train, X_test, y_train, y_test = train_test_split(X_selected, y, test_size=0.3, random_state=42, stratify=y)
+    
+            # Run model with SMOTE
+            all_results.append(run_model(X_train, X_test, y_train, y_test, scaler, n_top_features, param_grid_xgb, scoring, apply_smote=True))
+    
+            # Run model without SMOTE
+            all_results.append(run_model(X_train, X_test, y_train, y_test, scaler, n_top_features, param_grid_xgb, scoring, apply_smote=False))
+    
+    # Final summary of results
+    print("\nSummary of All Results:")
+    for result in all_results:
+        smote_status = "with SMOTE" if result['SMOTE Applied'] else "without SMOTE"
+        print(f"\nResults {smote_status} - TSFresh Features: {result['TSFresh Features']}")
+        print(f"AUC: {result['AUC']}")
+        print(f"Average Precision: {result['Average Precision']}")
+        print(f"Classification Report:\n{result['Classification Report']}")
+        print("="*60)
+        
+# Run the main function
+if __name__ == "__main__":
+    main()

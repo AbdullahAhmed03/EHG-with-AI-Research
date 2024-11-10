@@ -1,0 +1,176 @@
+import pandas as pd
+from tsfresh.feature_selection.relevance import calculate_relevance_table
+from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import roc_auc_score, average_precision_score, classification_report, make_scorer
+from sklearn.ensemble import AdaBoostClassifier
+from sklearn.tree import DecisionTreeClassifier
+from imblearn.over_sampling import SMOTE, ADASYN
+
+# Function to select top n TSFresh features
+def select_top_n_features(X, y, n_top_features):
+    relevance_table = calculate_relevance_table(X, y, ml_task='classification')
+    sorted_table = relevance_table.sort_values(by='p_value')
+    top_n_features = sorted_table.head(n_top_features)['feature']
+    return X[top_n_features], top_n_features
+
+# Function to run the model with SMOTE, ADASYN, or without oversampling
+def run_model(X_train, X_test, y_train, y_test, scaler, n_top_features, param_grid_ada, scoring, base_estimator, sampling_method=None):
+    # Apply the specified sampling method
+    if sampling_method == 'smote':
+        sampler = SMOTE(random_state=42)
+        X_train, y_train = sampler.fit_resample(X_train, y_train)
+        sampling_status = "with SMOTE"
+    elif sampling_method == 'adasyn':
+        sampler = ADASYN(random_state=42)
+        X_train, y_train = sampler.fit_resample(X_train, y_train)
+        sampling_status = "with ADASYN"
+    else:
+        sampling_status = "without oversampling"
+
+    # Scale data
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    # Initialize AdaBoost classifier
+    ada_model = AdaBoostClassifier(
+        estimator=base_estimator,
+        algorithm='SAMME',
+        random_state=42
+    )
+
+    # GridSearchCV setup
+    grid_search = GridSearchCV(
+        estimator=ada_model,
+        param_grid=param_grid_ada,
+        cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42),
+        scoring=scoring,
+        refit='AUC',
+        n_jobs=1,
+        verbose=1
+    )
+
+    # Fit model
+    print(f"\nRunning model {sampling_status} with base estimator max_depth={base_estimator.max_depth} and {n_top_features} TSFresh features")
+    grid_search.fit(X_train_scaled, y_train)
+
+    # Best estimator from GridSearchCV
+    best_ada_model = grid_search.best_estimator_
+    y_pred_proba = best_ada_model.predict_proba(X_test_scaled)
+
+    # Calculate AUC and Average Precision
+    auc = roc_auc_score(y_test, y_pred_proba, multi_class='ovr')
+    avg_precision = average_precision_score(y_test, y_pred_proba, average="macro")
+
+    # Classification report
+    y_pred = best_ada_model.predict(X_test_scaled)
+    report = classification_report(y_test, y_pred)
+
+    # Print and return results
+    print(f"Test AUC: {auc}")
+    print(f"Test Average Precision: {avg_precision}")
+    print(f"Classification Report:\n{report}")
+    
+    return {
+        'Sampling Method': sampling_method,
+        'TSFresh Features': n_top_features,
+        'Base Estimator Config': f"Decision Tree (depth={base_estimator.max_depth}, min_samples_leaf={base_estimator.min_samples_leaf})",
+        'AUC': auc,
+        'Average Precision': avg_precision,
+        'Classification Report': report,
+        'Best Hyperparameters': grid_search.best_params_
+    }
+
+def main():
+    # Load dataset
+    file_path = r"E:\Desktop\Machine Intelligence\combined extracted features with headers\combined_aligned_features.csv"
+    data = pd.read_csv(file_path)
+
+    # Drop unwanted columns (RecID, Pair_RecID)
+    data = data.drop(columns=["RecID", "Pair_RecID"])
+
+    # Encode categorical columns (Placental_position and RecType)
+    label_encoders = {}
+    for column in ['Placental_position', 'RecType']:
+        le = LabelEncoder()
+        data[column] = le.fit_transform(data[column])
+        label_encoders[column] = le
+
+    # Define obstetric features and features (X) and target (y)
+    obstetric_features = ['Gestation', 'Rectime', 'Age', 'Weight', 'Placental_position', 'Height', 'Newborn_weight']
+    X = data.drop(columns=['RecType'])
+    y = data['RecType']
+
+    # Identify TSFresh features
+    tsfresh_features = [col for col in X.columns if col not in obstetric_features]
+    tsfresh_feature_counts = [100]
+
+    # Define scalers
+    scalers = {
+        'StandardScaler': StandardScaler(),
+    }
+
+    # Define hyperparameter grid for AdaBoost
+    param_grid_ada = {
+        'n_estimators': [50],
+        'learning_rate': [0.5],
+        'estimator__min_samples_split': [5],
+        'estimator__min_samples_leaf': [1],
+        'estimator__max_features': ['sqrt']
+    }
+
+    # Define scoring metrics
+    scoring = {
+        'AUC': make_scorer(roc_auc_score, needs_proba=True, multi_class='ovr'),
+        'Average Precision': make_scorer(average_precision_score, needs_proba=True, average='macro')
+    }
+
+    # Define base estimators
+    base_estimators = [
+        DecisionTreeClassifier(max_depth=3, min_samples_leaf=3, random_state=42)
+    ]
+
+    # Store results for comparison
+    all_results = []
+
+    # Iterate over different scalers, TSFresh feature counts, and base estimator configurations
+    for scaler_name, scaler in scalers.items():
+        print(f"Testing with scaler: {scaler_name}")
+        for n_top_features in tsfresh_feature_counts:
+            print(f"Testing with {n_top_features} TSFresh features")
+            
+            # Select top TSFresh features
+            X_tsfresh = X[tsfresh_features]
+            X_tsfresh_selected, top_tsfresh_features = select_top_n_features(X_tsfresh, y, n_top_features)
+
+            # Combine obstetric features with selected TSFresh features
+            X_selected = pd.concat([X[obstetric_features], X_tsfresh_selected], axis=1)
+
+            # Split data into training and test sets
+            X_train, X_test, y_train, y_test = train_test_split(X_selected, y, test_size=0.3, random_state=42, stratify=y)
+
+            # Run model with each base estimator configuration
+            for base_estimator in base_estimators:
+                # Run model with SMOTE
+                all_results.append(run_model(X_train, X_test, y_train, y_test, scaler, n_top_features, param_grid_ada, scoring, base_estimator, sampling_method='smote'))
+
+                # Run model with ADASYN
+                all_results.append(run_model(X_train, X_test, y_train, y_test, scaler, n_top_features, param_grid_ada, scoring, base_estimator, sampling_method='adasyn'))
+
+                # Run model without any oversampling
+                all_results.append(run_model(X_train, X_test, y_train, y_test, scaler, n_top_features, param_grid_ada, scoring, base_estimator, sampling_method=None))
+
+    # Final summary of results
+    print("\nSummary of All Results:")
+    for result in all_results:
+        sampling_status = result['Sampling Method'] or "without oversampling"
+        print(f"\nResults {sampling_status} - TSFresh Features: {result['TSFresh Features']}, Base Estimator Config: {result['Base Estimator Config']}")
+        print(f"AUC: {result['AUC']}")
+        print(f"Average Precision: {result['Average Precision']}")
+        print(f"Classification Report:\n{result['Classification Report']}")
+        print(f"Best Hyperparameters: {result['Best Hyperparameters']}")
+        print("="*60)
+
+# Run the main function
+if __name__ == "__main__":
+    main()

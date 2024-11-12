@@ -1,0 +1,100 @@
+import pandas as pd
+import numpy as np
+from tsfresh import extract_features
+from tsfresh.feature_extraction import EfficientFCParameters
+from tsfresh.utilities.dataframe_functions import impute
+
+
+def feature_extraction(data):
+    # Assuming the data has the six columns: S1, S1_DOCFILT, S2, S2_DOCFILT, S3, S3_DOCFILT
+    signal_columns = ['S1', 'S1_DOCFILT', 'S2', 'S2_DOCFILT', 'S3', 'S3_DOCFILT']
+
+    # Create a time index based on the sampling rate (20 Hz -> 0.05 seconds between readings)
+    sampling_rate = 20  # Hz
+    time_interval = 1 / sampling_rate  # Time interval in seconds (0.05 seconds)
+    data['time'] = np.arange(len(data)) * time_interval  # Generate time series
+
+    # Add a constant 'id' column since all signals are from the same entity
+    data['id'] = 1
+
+    print(data)
+
+    # Specify the feature extraction parameters
+    extraction_settings = EfficientFCParameters()
+
+    # Extract features using tsfresh (with time, id, and all signal columns)
+    X = extract_features(data, column_id='id', column_sort='time', default_fc_parameters=extraction_settings)
+
+    # Impute the missing values (if any)
+    X = impute(X)
+
+    return X
+
+
+# Sample usage
+if __name__ == "__main__":
+
+    files_numbers = {'early_cesarean': [657, 666, 673, 814, 885, 976, 1089, 1175, 1187, 1393, 1443],
+                     'early_induced': [1248, 1297, 1303, 1361, 1388, 1394, 1408, 1416, 1444, 1449, 1454, 1496, 1568,
+                                       1570, 1599, 1680, 1698, 620, 656, 665, 691, 713, 757, 774, 806, 907, 958, 1011,
+                                       1064, 1077, 1081, 1086, 1124, 1148, 1180, 1185, 1235, 1243],
+                     'early_induced-cesarean': [571, 650, 759, 959, 985, 1019, 1053, 1091, 1098, 1131, 1330, 1530,
+                                                1682],
+                     'later_cesarean': [654, 675, 714, 851, 1373, 1580, 1623, 1650],
+                     'later_induced': [606, 629, 664, 668, 720, 756, 775, 784, 790, 799, 805, 811, 865, 871, 908, 924,
+                                       925, 956, 989, 1010, 1040, 1049, 1052, 1059, 1079, 1101, 1122, 1179, 1184, 1238,
+                                       1254, 1306, 1324, 1385, 1488, 1510, 1525, 1527, 1529, 1562, 1565, 1638, 1692],
+                     'later_induced-cesarean': [647, 763, 1096, 1117, 1141, 1193, 1218, 1255, 1390, 1430, 1439, 1473,
+                                                1655]
+                     }
+    for category, numbers in files_numbers.items():
+        for number in numbers:
+            # Path to the base of the file (without the extension)
+            file_base = fr'Data\{category}\icehg{number}'
+
+            # Load your main CSV or DataFrame
+            data = pd.read_csv(fr'Headers and Signals as CSV/{category}/icehg{number}_signals.csv')  # Replace with your actual file
+
+            # Remove the first and last 3000 rows
+            data = data.iloc[3000:-3000]
+
+            # Perform feature extraction
+            extracted_features = feature_extraction(data)
+
+            # Load the CSV file containing the 'comments' column
+            file_with_comments_data = pd.read_csv(
+                fr'Headers and Signals as CSV/{category}/icehg{number}_header.csv')  # Replace with the actual path
+
+            # Extract the 'comments' string
+            comments_string = file_with_comments_data['Comments'].iloc[0]
+
+            # Parse the comments string to extract values
+            parsed_data = {}
+            try:
+                # Remove "Comments:," prefix if present
+                if comments_string.startswith("Comments:,"):
+                    comments_string = comments_string.replace("Comments:,", "").strip()
+
+                # Split by comma to get key-value pairs
+                key_value_pairs = comments_string.split(", ")
+                for pair in key_value_pairs:
+                    # Split each pair by space to get the key and value separately
+                    key, value = pair.split(" ", 1)
+                    # Replace spaces in keys with underscores to make them suitable as column names
+                    parsed_data[key] = value
+            except Exception as e:
+                print(f"Error parsing comments for file {number}: {e}")
+
+            # Add each extracted field to the 'extracted_features' DataFrame as a new column
+            for key, value in parsed_data.items():
+                extracted_features[key] = value
+
+            # Move parsed columns to be the first in the DataFrame
+            parsed_columns = list(parsed_data.keys())
+            all_columns = parsed_columns + [col for col in extracted_features.columns if col not in parsed_columns]
+            extracted_features = extracted_features[all_columns]
+
+            # Save to a CSV file
+            extracted_features.to_csv(fr'Extracted Features/{category}/extracted_features_DOCFILT-{number}.csv',
+                                      index=False)
+            print(f"Feature extraction complete! Features saved to extracted_features_DOCFILT-{number}.csv")
